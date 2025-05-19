@@ -1,0 +1,8 @@
+jax>=0.5.3
+jaxlib>=0.5.3
+brax>=0.12.0
+numpy>=1.22.0
+flax>=0.10
+ipython  # For HTML display in notebooks
+# webbrowser  # For opening visualizations in the default browser
+mujoco-mjx
