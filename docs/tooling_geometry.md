@@ -1,6 +1,26 @@
 # Tooling Geometry Specifications
 
-This document details the geometric and physical properties of all tools and the tool stand in the simulation.
+This document details the geometric and physical properties of all tools and the tool stand in the simulation. 
+
+> **Note on End Effectors**:
+> - Prefer using end effectors from the [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) collection when possible.
+> - These models are high-quality, physically accurate, and well-tested.
+> - They include proper collision meshes and realistic physical properties.
+> - Using these models ensures consistency with other MuJoCo-based simulations.
+> - Custom tools should only be created when no suitable Menagerie model exists.
+
+## Implementation Guidelines
+
+1. **Model Sources**:
+   - First check [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) for existing models
+   - Use the `mjx`-compatible versions when available
+   - Document any modifications made to the original models
+
+2. **Custom Tools**:
+   - Only create custom tools when necessary
+   - Follow the same conventions as Menagerie models
+   - Include proper collision meshes and physical properties
+   - Document the design decisions and specifications
 
 ## Tool Stand
 

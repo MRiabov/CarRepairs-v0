@@ -29,13 +29,14 @@ This document outlines the 3D models and their specifications required for the c
 
 ## Robot Arm
 - **Base**: Fixed to the workbench
-- **Joints**: 6-DOF robotic arm
+- **Joints**: 6-DOF Franka arm - sourced from Mujoco Menagerie.
 - **End Effector Mount**: Standard interface for tool attachment
 
 ## Work Area
 - **Workbench**: Flat surface for parts and tools
 - **Tool Stand**: Dedicated area for storing end effectors
 - **Parts Tray**: Area for removed components
+- **Car**: The car itself (work environment).
 
 ## Collision Geometry
 - All components will have simplified collision meshes for physics simulation
