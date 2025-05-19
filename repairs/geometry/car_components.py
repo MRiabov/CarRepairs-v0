@@ -8,14 +8,22 @@ diverse repair scenarios.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, Tuple, Optional, Any, List
+from typing import Dict, Any, TypeVar, Tuple
 
-import jax
 import jax.numpy as jp
 from jax import random
-import mujoco
+import numpy as np
 
-from repairs.geometry.config import Array
+try:
+    import genesis as gs
+    GENESIS_AVAILABLE = True
+except ImportError:
+    GENESIS_AVAILABLE = False
+
+# Type aliases
+JaxArray = jp.ndarray
+NpArray = np.ndarray
+Array = TypeVar('Array', JaxArray, NpArray)  # Type that can be either JAX or NumPy array
 
 # Randomization parameters
 RANDOM_SCALE = 0.2  # ±20% variation in dimensions
@@ -104,6 +112,61 @@ class Battery:
         return {
             'battery_body': battery_geom,
             'battery_terminals': ['positive_terminal', 'negative_terminal']
+        }
+        
+    def create_genesis_entity(self, scene: Any, name: str = "battery") -> Dict[str, Any]:
+        """Create a Genesis entity for this battery.
+        
+        Args:
+            scene: The Genesis scene to add the battery to.
+            name: Name for the battery entity.
+            
+        Returns:
+            Dictionary containing the created entities.
+        """
+        if not GENESIS_AVAILABLE:
+            raise ImportError("Genesis is not available. Please install the genesis package.")
+            
+        # Create a box morph for the battery
+        box = gs.morphs.Box(half_extents=np.array(self.dims)/2)
+        
+        # Create the entity with visual material
+        entity = scene.add_entity(
+            box,
+            surface=gs.surfaces.Plastic(color=(0.2, 0.2, 0.2, 1.0))
+        )
+        
+        # Set position and orientation
+        entity.position = [float(x) for x in self.pos]
+        entity.euler = [float(x) for x in self.euler]
+        entity.name = name
+        
+        # Create terminals
+        terminal_radius = 0.01
+        terminal_height = 0.03
+        terminal_offset = np.array([0.08, 0, self.dims[2]/2 + terminal_height/2])
+        
+        # Positive terminal (red)
+        pos_terminal = scene.add_entity(
+            gs.morphs.Cylinder(radius=terminal_radius, height=terminal_height),
+            surface=gs.surfaces.Plastic(color=(0.8, 0.1, 0.1, 1.0))
+        )
+        pos_terminal.position = [float(x) for x in (self.pos + terminal_offset * np.array([1, 1, 1]))]
+        pos_terminal.euler = [0, np.pi/2, 0]
+        pos_terminal.name = f"{name}_positive_terminal"
+        
+        # Negative terminal (black)
+        neg_terminal = scene.add_entity(
+            gs.morphs.Cylinder(radius=terminal_radius, height=terminal_height),
+            surface=gs.surfaces.Plastic(color=(0.1, 0.1, 0.1, 1.0))
+        )
+        neg_terminal.position = [float(x) for x in (self.pos + terminal_offset * np.array([1, -1, 1]))]
+        neg_terminal.euler = [0, np.pi/2, 0]
+        neg_terminal.name = f"{name}_negative_terminal"
+        
+        return {
+            'battery': entity,
+            'terminals': [pos_terminal, neg_terminal]
         }
 
 @dataclass
@@ -218,6 +281,70 @@ class EngineBay:
             'oil_dipstick': dipstick,
             'oil_filter': oil_filter
         }
+        
+    def create_genesis_entities(self, scene: Any, parent_name: str = "car") -> Dict[str, Any]:
+        """Create Genesis entities for the engine bay.
+        
+        Args:
+            scene: The Genesis scene to add the engine bay to.
+            parent_name: Name of the parent entity.
+            
+        Returns:
+            Dictionary containing the created entities.
+        """
+        if not GENESIS_AVAILABLE:
+            raise ImportError("Genesis is not available. Please install the genesis package.")
+            
+        entities = {}
+        
+        # Create engine bay body
+        box = gs.morphs.Box(half_extents=np.array(self.dims)/2)
+        
+        # Create the entity with visual material
+        engine_bay = scene.add_entity(
+            box,
+            surface=gs.surfaces.Plastic(color=(0.3, 0.3, 0.3, 1.0))
+        )
+        engine_bay.position = [float(x) for x in self.pos]
+        engine_bay.euler = [float(x) for x in self.euler]
+        engine_bay.name = f"{parent_name}_engine_bay"
+        entities['engine_bay'] = engine_bay
+        
+        # Create engine block
+        engine_block_dims = self.dims * np.array([0.33, 0.38, 0.5])
+        engine_block = scene.add_entity(
+            gs.morphs.Box(half_extents=engine_block_dims/2),
+            surface=gs.surfaces.Plastic(color=(0.2, 0.2, 0.2, 1.0))
+        )
+        engine_block.position = [float(x) for x in (self.pos + self.component_positions['engine_block'])]
+        engine_block.name = f"{parent_name}_engine_block"
+        entities['engine_block'] = engine_block
+        
+        # Create oil fill cap
+        cap_radius = 0.025  # 2.5cm radius
+        cap_height = 0.02
+        oil_cap = scene.add_entity(
+            gs.morphs.Cylinder(radius=cap_radius, height=cap_height),
+            surface=gs.surfaces.Plastic(color=(0.8, 0.8, 0.0, 1.0))
+        )
+        oil_cap.position = [float(x) for x in (self.pos + self.component_positions['oil_fill_cap'])]
+        oil_cap.euler = [np.pi/2, 0, 0]  # Rotate to be horizontal
+        oil_cap.name = f"{parent_name}_oil_fill_cap"
+        entities['oil_fill_cap'] = oil_cap
+        
+        # Create oil dipstick
+        dipstick_radius = 0.005  # 5mm radius
+        dipstick_length = 0.2  # 20cm length
+        dipstick = scene.add_entity(
+            gs.morphs.Cylinder(radius=dipstick_radius, height=dipstick_length),
+            surface=gs.surfaces.Plastic(color=(0.9, 0.9, 0.9, 1.0))
+        )
+        dipstick.position = [float(x) for x in (self.pos + self.component_positions['oil_dipstick'])]
+        dipstick.euler = [0, np.pi/2, 0]  # Rotate to be horizontal
+        dipstick.name = f"{parent_name}_oil_dipstick"
+        entities['oil_dipstick'] = dipstick
+        
+        return entities
 
 @dataclass
 class CarFront:
@@ -243,8 +370,15 @@ class CarFront:
         # Position components
         self._position_components(key3)
     
-    def _position_components(self, key: jp.ndarray) -> None:
-        """Position components within the car front."""
+    def _position_components(self, key: jp.ndarray) -> Tuple[jp.ndarray, jp.ndarray, jp.ndarray]:
+        """Position components within the car front.
+        
+        Args:
+            key: JAX random key for reproducibility
+            
+        Returns:
+            Tuple containing the positions of (engine_bay, battery, car_front)
+        """
         # Place engine bay in the front of the car
         engine_pos = jp.array([
             1.2 + 0.2 * (2.0 * random.uniform(key, ()) - 1.0),  # x: 1.0-1.4
@@ -256,7 +390,7 @@ class CarFront:
         battery_pos = jp.array([0.0, 0.0, 0.0])
         key, subkey = random.split(key)
         
-        for _ in range(MAX_ATTEMPTS):
+        for _ in range(10):  # MAX_ATTEMPTS
             key, subkey = random.split(key)
             # Try placing battery either left or right of engine bay
             side = 1.0 if random.uniform(subkey, ()) > 0.5 else -1.0
@@ -266,15 +400,27 @@ class CarFront:
                 0.2 + 0.1 * random.uniform(subkey, ())  # z: 0.2-0.3
             ])
             
-            # Check for overlap
-            min_dist = jp.linalg.norm(engine_pos - battery_pos)
-            if min_dist > (jp.linalg.norm(self.engine_bay.dims) + 
-                          jp.linalg.norm(self.battery.dims)) / 2 + MIN_COMPONENT_DISTANCE:
+            # Check for collision with engine bay
+            if jp.linalg.norm(battery_pos - engine_pos) > 0.5:  # Minimum distance
                 break
+        else:
+            # If we couldn't find a non-overlapping position, place it at a safe distance
+            battery_pos = jp.array([
+                0.8,
+                0.5 * (1.0 if random.uniform(key, ()) > 0.5 else -1.0),
+                0.25
+            ])
         
-        # Set the final positions
-        self.battery.pos = battery_pos
+        # Set component positions
         self.engine_bay.pos = engine_pos
+        self.battery.pos = battery_pos
+        
+        # Calculate car front position (centered between engine bay and battery)
+        car_front_pos = (engine_pos + battery_pos) / 2.0
+        max_z = float(jp.maximum(engine_pos[2], battery_pos[2]))
+        car_front_pos = car_front_pos.at[2].set(max_z + 0.1)
+        
+        return engine_pos, battery_pos, car_front_pos
     
     def create_mjcf(self, parent) -> Dict[str, Any]:
         """Create MJCF elements for the car front.
@@ -315,50 +461,15 @@ class CarFront:
 def create_car_components(key: jp.ndarray) -> Tuple[Battery, EngineBay]:
     """Create and return the car components with randomized positions and sizes.
     
+    This function is deprecated. Use the CarFront class instead for better
+    component placement and collision avoidance.
+    
     Args:
         key: JAX random key for reproducibility
         
     Returns:
         A tuple containing (battery, engine_bay) components with randomized properties.
     """
-    # Split the key for different components
-    key1, key2, key3 = random.split(key, 3)
-    
-    # Create components with random properties
-    battery = Battery(key=key1)
-    engine_bay = EngineBay(key=key2)
-    
-    # Generate random positions ensuring no overlap
-    # We'll place the engine bay first, then the battery
-    
-    # Place engine bay in the front of the car
-    engine_pos = jp.array([
-        0.8 + 0.2 * (2.0 * random.uniform(key3, ()) - 1.0),  # x: 0.6-1.0
-        0.0,  # y: centered
-        MIN_ENGINE_HEIGHT + 0.1 * random.uniform(key3, ())  # z: 0.2-0.3
-    ])
-    
-    # Place battery near the engine bay but not overlapping
-    # We'll try a few positions to find a non-overlapping one
-    battery_pos = jp.array([0.0, 0.0, 0.0])
-    
-    for _ in range(MAX_ATTEMPTS):
-        key3, subkey = random.split(key3)
-        # Try placing battery either left or right of engine bay
-        side = 1.0 if random.uniform(subkey, ()) > 0.5 else -1.0
-        battery_pos = jp.array([
-            0.5 + 0.2 * (2.0 * random.uniform(subkey, ()) - 1.0),  # x: 0.3-0.7
-            side * (0.3 + 0.1 * random.uniform(subkey, ())),  # y: ±(0.3-0.4)
-            0.1 + 0.05 * random.uniform(subkey, ())  # z: 0.1-0.15
-        ])
-        
-        # Check for overlap
-        min_dist = jp.linalg.norm(engine_pos - battery_pos)
-        if min_dist > (jp.linalg.norm(engine_bay.dims) + jp.linalg.norm(battery.dims)) / 2 + MIN_COMPONENT_DISTANCE:
-            break
-    
-    # Set the final positions
-    battery.pos = battery_pos
-    engine_bay.pos = engine_pos
-    
-    return battery, engine_bay
+    # Create a CarFront instance which handles component creation and placement
+    car_front = CarFront(key=key)
+    return car_front.battery, car_front.engine_bay
