@@ -18,13 +18,15 @@ from .config import *  # noqa
 # Explicitly list all public API symbols
 __all__ = [
     # Genesis components
-    'GenesisWorld',
-    'create_default_genesis_world',
-    'Battery',
-    'EngineBay',
-    'CarFront',
-    'create_car_components'
+    "GenesisWorld",
+    "create_default_genesis_world",
+    "Battery",
+    "EngineBay",
+    "CarFront",
+    "create_car_components",
 ]
 
 # Also include all non-underscored symbols from other modules
-__all__.extend([name for name in dir() if not name.startswith('_') and name not in __all__])
+__all__.extend(
+    [name for name in dir() if not name.startswith("_") and name not in __all__]
+)

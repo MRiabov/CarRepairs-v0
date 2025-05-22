@@ -22,3 +22,6 @@ coverage.xml
 instance
 .mypy_cache
 .pytest_cache
+
+#custom
+*.mp4

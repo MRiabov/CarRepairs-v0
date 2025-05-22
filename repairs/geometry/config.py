@@ -16,7 +16,7 @@ TOOL_NAMES = {
     TOOL_GRIPPER: "Parallel Jaw Gripper",
     TOOL_SUCTION: "Suction Cup",
     TOOL_SCREWDRIVER: "Screwdriver",
-    TOOL_WRENCH: "Socket Wrench"
+    TOOL_WRENCH: "Socket Wrench",
 }
 
 # Tool stand configuration

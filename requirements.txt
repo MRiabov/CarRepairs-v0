@@ -5,4 +5,5 @@ numpy>=1.22.0
 flax>=0.10
 ipython  # For HTML display in notebooks
 # webbrowser  # For opening visualizations in the default browser
-mujoco-mjx
+genesis-world
+libigl==2.5.1
