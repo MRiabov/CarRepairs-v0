@@ -149,9 +149,9 @@ class SACCritic(nnx.Module):
         )
 
         # Linear layers for state+action encoding
-        # Input dim: voxel + video + robot_obs + action
+        # Input dim: voxel + video + electronic_graph_obs + action
         combined_obs_dim = (
-            216 + 324 + electronic_graph_obs_dim + act_dim
+            216 + 324 + electronic_graph_obs_dim[0] + act_dim
         )  # as described above
 
         self.hidden1 = nnx.Linear(combined_obs_dim, 256, rngs=rngs, dtype=net_dtype)
@@ -277,7 +277,7 @@ if __name__ == "__main__":
 
     obs_cfg = {
         "num_obs": 3,  # RGB, depth, segmentation
-        "res": (640, 480),
+        "res": (256, 256),
     }
 
     reward_cfg = {
@@ -303,13 +303,19 @@ if __name__ == "__main__":
     )
     action_dim = env_cfg["num_actions"]
     num_cameras = 2
-    vision_obs_dim = (num_cameras, 256, 256)  # 2 cameras
+    vision_obs_dim = (
+        num_cameras,
+        256,
+        256,
+        7,
+    )  # 2 cameras, 7 channels (RGB, depth, segmentation)
     electronics_graph_dim = (10,)  # fill in when ready
     voxel_obs_dim = (2, 256, 256, 256)  # start and finish # should be sparse?
 
-    batch_size = 16 if jax.default_backend() == "cpu" else 256
+    batch_size = 16 if jax.default_backend() == "cpu" else 64  # 256
     train_steps = (10_000_000 if jax.default_backend() == "gpu" else 3000) // batch_size
-    buffer_size = 200_000
+    buffer_size = 10000  # was 200_000, reduced due to GPU constraints.
+    # ^46gb at 2*256*256*7*int8 res!!!
     sample_batch_size = 256
 
     rngs = nnx.Rngs(0, action=1, env=2, buffer=3)
