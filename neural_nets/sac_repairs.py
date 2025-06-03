@@ -5,6 +5,8 @@ import flax
 import jax
 import jax.numpy as jnp
 import numpy as np
+from repairs_components.processing.tasks import AssembleTask
+import torch
 import optax
 from flax import nnx
 from functools import partial
@@ -13,19 +15,18 @@ import flashbax as fbx
 from flax.struct import dataclass, PyTreeNode
 from orbax.checkpoint import (
     CheckpointManager,
-    CheckpointHandlerRegistry,
     PyTreeCheckpointer,
     JsonCheckpointHandler,
     CheckpointManagerOptions,
 )
 import orbax.checkpoint as ocp
 import json
-# from brax import envs as brax_envs
-# from brax.io.html import render
-# from IPython.display import HTML, display
-# from brax.io import html
+from jax import dlpack
+from repairs_components.training_utils.gym_env import RepairsEnv
 
-from src.training_utils.env import RepairsEnv
+from genesis import gs
+from examples.box_to_pos_task import MoveBoxSetup
+
 
 # jax.config.update("jax_compilation_cache_dir", "/cache/jax_cache")
 # jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
@@ -63,11 +64,13 @@ class SACActor(nnx.Module):
         self.video_conv_3 = nnx.Conv(
             8, 12, kernel_size=(6, 6), strides=(4, 4), rngs=rngs
         )  # 3*3*3 (12), 324
-        combined_obs_dim = 216 + 324 + robot_obs_dim[0]
-        self.robot_hidden_1 = nnx.Linear(
+        combined_obs_dim = 216 + 324 + electronics_graph_dim[0]
+        self.electronic_graph_hidden_1 = nnx.Linear(
             combined_obs_dim, 256, rngs=rngs, dtype=net_dtype
         )
-        self.robot_hidden_2 = nnx.Linear(256, 256, rngs=rngs, dtype=net_dtype)
+        self.electronic_graph_hidden_2 = nnx.Linear(
+            256, 256, rngs=rngs, dtype=net_dtype
+        )
         self.out_mean = nnx.Linear(256, action_dim, rngs=rngs, dtype=net_dtype)
         self.out_log_std = nnx.Linear(256, action_dim, rngs=rngs, dtype=net_dtype)
 
@@ -90,14 +93,14 @@ class SACActor(nnx.Module):
 
         # Concatenate all encodings
         x = jnp.concatenate([x_voxel, x_video, robot_obs], axis=-1)
-        x = nnx.silu(self.robot_hidden_1(x))
-        x = nnx.silu(self.robot_hidden_1(x))
+        x = nnx.silu(self.electronic_graph_hidden_1(x))
+        x = nnx.silu(self.electronic_graph_hidden_2(x))
         mean = self.out_mean(x)
         log_std = jnp.clip(self.out_log_std(x), -5.0, 2.0)
         return mean, log_std
 
-    def sample_action(self, voxel_obs, video_obs, robot_obs, rngs: nnx.Rngs):
-        mean, log_std = self.__call__(voxel_obs, video_obs, robot_obs)
+    def sample_action(self, voxel_obs, video_obs, electronic_graph_obs, rngs: nnx.Rngs):
+        mean, log_std = self.__call__(voxel_obs, video_obs, electronic_graph_obs)
         std = jnp.exp(log_std)
         if self.deterministic:
             pre_tanh = mean
@@ -115,7 +118,13 @@ class SACActor(nnx.Module):
 
 
 class SACCritic(nnx.Module):
-    def __init__(self, act_dim: int, robot_obs_dim, rngs, net_dtype=jnp.bfloat16):
+    def __init__(
+        self,
+        act_dim: int,
+        electronic_graph_obs_dim,  # Note: compressed!! dim.
+        rngs,
+        net_dtype=jnp.bfloat16,
+    ):
         # simple 2‐layer MLP for each Q‐head
         # Voxel encoder for state
         self.voxel_conv_1 = nnx.Conv(
@@ -141,7 +150,9 @@ class SACCritic(nnx.Module):
 
         # Linear layers for state+action encoding
         # Input dim: voxel + video + robot_obs + action
-        combined_obs_dim = 216 + 324 + robot_obs_dim + act_dim  # as described above
+        combined_obs_dim = (
+            216 + 324 + electronic_graph_obs_dim + act_dim
+        )  # as described above
 
         self.hidden1 = nnx.Linear(combined_obs_dim, 256, rngs=rngs, dtype=net_dtype)
         self.hidden2 = nnx.Linear(256, 256, rngs=rngs, dtype=net_dtype)
@@ -230,14 +241,73 @@ def temperature_loss_fn(actor, log_alpha, s, rngs: nnx.Rngs, target_entropy):
 
 
 if __name__ == "__main__":
-    # env = brax_envs.get_environment("ant") # debug
-    env = RepairsEnv()
-    action_dim = env.action_size
-    vision_obs_dim = (3, 256, 256)  # 3 cameras
-    robot_obs_dim = (10,)  # fill in when ready
+    # Initialize Genesis
+    gs.init(backend=gs.cuda)
+
+    # Create task and environment setup
+    task = AssembleTask()
+    env_setup = MoveBoxSetup()
+
+    # Environment configuration
+    env_cfg = {
+        "num_actions": 9,  # [x, y, z, quat_w, quat_x, quat_y, quat_z, gripper_force_left, gripper_force_right]
+        "joint_names": [
+            "joint1",
+            "joint2",
+            "joint3",
+            "joint4",
+            "joint5",
+            "joint6",
+            "joint7",
+            "finger_joint1",
+            "finger_joint2",
+        ],
+        "default_joint_angles": {
+            "joint1": 0.0,
+            "joint2": -0.3,
+            "joint3": 0.0,
+            "joint4": -2.0,
+            "joint5": 0.0,
+            "joint6": 2.0,
+            "joint7": 0.79,  # no "hand" here? there definitely was hand.
+            "finger_joint1": 0.04,
+            "finger_joint2": 0.04,
+        },
+    }
+
+    obs_cfg = {
+        "num_obs": 3,  # RGB, depth, segmentation
+        "res": (640, 480),
+    }
+
+    reward_cfg = {
+        "success_reward": 10.0,
+        "progress_reward_scale": 1.0,
+        "progressive": True,  # TODO : if progressive, use progressive reward calc instead.
+    }
+
+    command_cfg = {}
+
+    # Create gym environment
+    print("Creating gym environment...")
+    env = RepairsEnv(
+        env_setup=env_setup,
+        tasks=[task],
+        num_envs=2,
+        env_cfg=env_cfg,
+        obs_cfg=obs_cfg,
+        reward_cfg=reward_cfg,
+        command_cfg=command_cfg,
+        show_viewer=True,
+        num_scenes_per_task=1,
+    )
+    action_dim = env_cfg["num_actions"]
+    num_cameras = 2
+    vision_obs_dim = (num_cameras, 256, 256)  # 2 cameras
+    electronics_graph_dim = (10,)  # fill in when ready
     voxel_obs_dim = (2, 256, 256, 256)  # start and finish # should be sparse?
 
-    batch_size = 16 if jax.default_backend() == "cpu" else 64
+    batch_size = 16 if jax.default_backend() == "cpu" else 256
     train_steps = (10_000_000 if jax.default_backend() == "gpu" else 3000) // batch_size
     buffer_size = 200_000
     sample_batch_size = 256
@@ -253,7 +323,9 @@ if __name__ == "__main__":
     buffer_state = buffer.init(
         {
             "video_obs": jnp.zeros(vision_obs_dim, dtype=jnp.int8),
-            "robot_obs": jnp.zeros(robot_obs_dim, dtype=jnp.float32),
+            "electronics_graph_obs": jnp.zeros(
+                electronics_graph_dim, dtype=jnp.float32
+            ),
             # "voxel_obs": jnp.zeros(voxel_obs_dim, dtype=jnp.int8), #make it static for now.
             "reward": jnp.zeros((), jnp.float32),
             "action": jnp.zeros((action_dim,), dtype=jnp.float32),
@@ -266,7 +338,7 @@ if __name__ == "__main__":
         action_dim=action_dim,
         rngs=rngs,
     )
-    critic = SACCritic(action_dim, robot_obs_dim, rngs)
+    critic = SACCritic(action_dim, electronics_graph_dim, rngs)
 
     actor.train()
     critic.train()
@@ -274,20 +346,66 @@ if __name__ == "__main__":
 
     target_entropy = -action_dim
 
-    def vmap_reset(keys):
-        states = jax.vmap(env.reset)(keys)
-        obs_tuple = jax.vmap(lambda s: s.obs)(states)
-        return obs_tuple, states
+    # Using pure_callback to interface with PyTorch-based RepairsEnv
+    def env_reset(key: jax.Array):
+        # Function to reset environment in PyTorch land
+        def _reset_impl(rng_key: jax.Array):
+            obs, info = env.reset(torch.from_dlpack(jax.dlpack.to_dlpack(rng_key)))
+            video_obs = jax.dlpack.from_dlpack(torch.to_dlpack(obs))
+            return video_obs  # it also returns the desired state...
 
-    def vmap_step(keys, states, actions):
-        next_states = jax.vmap(env.step)(states, actions)
-        obs_tuple = jax.vmap(lambda s: s.obs)(next_states)
-        rewards = jax.vmap(lambda s: s.reward)(next_states)
-        dones = jax.vmap(lambda s: jnp.asarray(s.done, dtype=jnp.bool_))(next_states)
-        return obs_tuple, next_states, rewards, dones, None
+        # Convert back to JAX arrays
+        return jax.pure_callback(
+            _reset_impl,
+            (
+                jnp.zeros(
+                    (env.num_envs, len(env.cameras), *env.obs_cfg["res"], 7),
+                    dtype=jnp.float32,
+                ),
+                None,
+            ),
+            key,
+        )
 
-    (video_obs, robot_obs), buffer_env_states = vmap_reset(batch_rng)
-    voxel_obs = jnp.zeros(voxel_obs_dim, dtype=jnp.int8)
+    def env_step(
+        actions: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, dict]:
+        # Function to step environment in PyTorch land
+        def external_step(actions_jnp: jax.Array):
+            # Convert jax.Array actions to torch tensors
+            # dlpack is a library for converting arrays between different frameworks. Faster than torch.array or similar.
+            actions_torch = torch.from_dlpack(
+                jax.dlpack.to_dlpack(actions_jnp),
+            )  # note: as of jax 0.6.0 jax.dlpack.to_dlpack is unnecessary, simply pass jax array directly to from_dlpack of torch.
+            # Execute step in environment
+            obs, rewards, dones, info = env.step(actions_torch)
+            # Convert torch tensors to numpy arrays
+            video_obs = jax.dlpack.from_dlpack(torch.to_dlpack(obs))
+            rewards = jax.dlpack.from_dlpack(torch.to_dlpack(rewards))
+            dones = jax.dlpack.from_dlpack(torch.to_dlpack(dones))
+            # Return observations, rewards, dones in expected format
+            electronics_graph_obs = jnp.zeros(
+                (batch_size,) + electronics_graph_dim, dtype=jnp.float32
+            )
+            return (video_obs, electronics_graph_obs, rewards, dones, {})
+
+        # Convert back to JAX arrays
+        return jax.pure_callback(
+            external_step,
+            (
+                jnp.zeros((batch_size,) + vision_obs_dim, dtype=jnp.float32),
+                None,  # robot obs placeholder
+                jnp.zeros((batch_size,), dtype=jnp.float32),
+                jnp.zeros((batch_size,), dtype=jnp.bool_),
+                {},
+            ),
+            actions,
+        )
+
+    # Initialize environment - only need to get observations
+    video_obs, electronics_graph_obs = env_reset(batch_rng)
+    # Initialize voxel observations with zeros # placeholder
+    voxel_obs = jnp.zeros((batch_size,) + voxel_obs_dim, dtype=jnp.int8)
 
     log_alpha = jnp.array(jnp.log(0.2))
 
@@ -337,7 +455,15 @@ if __name__ == "__main__":
 
     @partial(jax.jit, donate_argnums=(0,))
     def fill_buffer_step(carry, _):
-        buffer_env_states, (prev_robot_obs, prev_video_obs), buffer_state, rng = carry
+        (
+            buffer_env_states,
+            (
+                prev_video_obs,
+                prev_electronics_graph_obs,
+            ),  # not sure if it's correct that it's unused. *it was*.
+            buffer_state,
+            rng,
+        ) = carry
 
         rng, action_rng, step_rng = jax.random.split(rng, 3)
 
@@ -345,29 +471,21 @@ if __name__ == "__main__":
             action_rng, shape=(batch_size, env.action_size), minval=-1.0, maxval=1.0
         )
 
-        new_obs, new_env_states, rewards, dones, _infos = vmap_step(
-            jax.random.split(step_rng, batch_size), buffer_env_states, random_actions
+        new_obs, electronics_graph_obs, rewards, dones, _infos = env_step(
+            random_actions
         )
 
-        (reset_robot_obs, reset_video_obs), reset_states = vmap_reset(batch_rng)
-        new_video_obs = jnp.where(dones[:, None], reset_video_obs, prev_video_obs)
-        new_robot_obs = jnp.where(dones[:, None], reset_robot_obs, prev_robot_obs)
-
-        new_env_states = jax.vmap(
-            lambda done, reset, not_reset: jax.lax.cond(
-                done,
-                lambda reset, not_reset: reset,
-                lambda reset, not_reset: not_reset,
-                reset,
-                not_reset,
-            )
-        )(dones, reset_states, new_env_states)
+        # reset_video_obs, reset_electronics_graph_obs = env_reset(batch_rng)
+        # new_video_obs = jnp.where(dones[:, None], reset_video_obs, new_obs)
+        # new_electronics_graph_obs = jnp.where(
+        #     dones[:, None], reset_electronics_graph_obs, electronics_graph_obs
+        # ) # done by torch, implicitly.
 
         buffer_state = buffer.add(
             buffer_state,
             {
-                "video_obs": prev_video_obs,
-                "robot_obs": prev_robot_obs,
+                "video_obs": new_obs,
+                "electronics_graph_obs": electronics_graph_obs,
                 # "voxel_obs": prev_obs,
                 "action": random_actions,
                 "reward": rewards,
@@ -375,11 +493,17 @@ if __name__ == "__main__":
             },
         )
 
-        return (new_env_states, new_obs, buffer_state, rng), None
+        return (
+            buffer_env_states,
+            (new_video_obs, new_electronics_graph_obs),
+            buffer_state,
+            rng,
+        ), None
 
+    # With the RepairsEnv, environment state is managed internally by the environment
+    # We only need to track observations
     fill_buffer_carry = (
-        buffer_env_states,
-        (video_obs, robot_obs),
+        (video_obs, electronics_graph_obs),
         buffer_state,
         rngs.env(),
     )
@@ -389,13 +513,14 @@ if __name__ == "__main__":
         fill_buffer_step, fill_buffer_carry, None, length=fill_steps
     )
 
-    buffer_env_states, obs, buffer_state, env_rng = fill_buffer_carry
-    reset_obs, buffer_env_states = vmap_reset(batch_rng)
+    obs, buffer_state, env_rng = fill_buffer_carry
+    reset_video_obs, reset_electronic_graph_obs = env_reset(batch_rng)
+    reset_obs = (reset_video_obs, reset_electronic_graph_obs)
 
     batch_rng = jax.random.split(env_rng, batch_size)
 
     carry = (
-        buffer_env_states,
+        # None,  # No need to track env states explicitly
         reset_obs,
         nnx.State(buffer_state),
         rngs,
@@ -414,11 +539,11 @@ if __name__ == "__main__":
     @nnx.jit
     def train_step(carry):
         (
-            old_env_states,
+            # old_env_states,
             (
-                prev_robot_obs,
                 prev_video_obs,
-                voxel_obs,
+                prev_electronic_graph_obs,
+                # voxel_obs,
             ),  # TODO check that it is in correct order.
             buffer_state,
             rngs,
@@ -441,7 +566,7 @@ if __name__ == "__main__":
             experience={
                 "action": experience["action"],
                 "done": experience["done"],
-                "robot_obs": experience["robot_obs"],
+                "electronic_graph_obs": experience["electronic_graph_obs"],
                 "video_obs": experience["video_obs"],
                 "reward": experience["reward"],
             },
@@ -451,12 +576,10 @@ if __name__ == "__main__":
 
         batch_rng = jax.random.split(rngs.env(), batch_size)
         action, _log_prob = actor.sample_action(
-            prev_video_obs, prev_robot_obs, voxel_obs, rngs
+            prev_video_obs, prev_electronic_graph_obs, voxel_obs, rngs
         )
 
-        (video_obs, robot_obs), new_env_states, reward, done, _infos = vmap_step(
-            batch_rng, old_env_states, action
-        )
+        video_obs, electronic_graph_obs, reward, done, _infos = env_step(action)
         assert video_obs.shape == video_obs.shape, (
             f"Obs dim mismatch: {video_obs.shape} vs {video_obs.shape}"
         )
@@ -466,33 +589,19 @@ if __name__ == "__main__":
         )
 
         batch_rng = jax.random.split(rngs.env(), batch_size)
-        (reset_video_obs, reset_robot_obs), reset_state = vmap_reset(batch_rng)
+        reset_video_obs, reset_robot_obs = env_reset(batch_rng)
         new_video_obs = jnp.where(done[:, None], reset_video_obs, video_obs)
-        new_robot_obs = jnp.where(done[:, None], reset_robot_obs, robot_obs)
+        new_electronic_graph_obs = jnp.where(
+            done[:, None], reset_robot_obs, electronic_graph_obs
+        )
         # voxel obs is static (yet)
 
-        def choose_state(done, reset, not_reset):
-            # reward ctrl returned float16 vs float, so this is a fix.
-            reset.metrics["reward_ctrl"] = reset.metrics["reward_ctrl"].astype(
-                jnp.bfloat16
-            )
-            # pick reset or not_reset
-            st = jax.lax.cond(
-                done,
-                lambda r, nr: jax.tree.map(lambda x: x.astype(jnp.float32), r),
-                lambda r, nr: jax.tree.map(lambda x: x.astype(jnp.float32), nr),
-                reset,
-                not_reset,
-            )
-            return st
-
-        new_env_states = jax.vmap(choose_state)(done, reset_state, new_env_states)
-
+        # Environment state handling is now managed by RepairsEnv
         buffer_state = buffer.add(
             buffer_state,
             {
-                "robot_obs": prev_robot_obs,
                 "video_obs": prev_video_obs,
+                "electronic_graph_obs": prev_electronic_graph_obs,
                 "action": action.astype(jnp.float32),
                 "reward": reward,
                 "done": done,
@@ -501,7 +610,7 @@ if __name__ == "__main__":
 
         batch = buffer.sample(buffer_state, rngs.buffer())
         s = (
-            batch.experience.first["robot_obs"],
+            batch.experience.first["electronic_graph_obs"],
             batch.experience.first["video_obs"],
             voxel_obs,
         )
@@ -509,21 +618,10 @@ if __name__ == "__main__":
         r = batch.experience.first["reward"]
         d = batch.experience.first["done"]
         next_s = (
-            batch.experience.second["robot_obs"],
+            batch.experience.second["electronic_graph_obs"],
             batch.experience.second["video_obs"],
             voxel_obs,
         )
-        # print("s.shape:", s.shape)
-
-        # assert s.shape[0] == a.shape[0], (
-        #     "Batch size mismatch in buffer sample"
-        # )  # 24.5 huh?
-        # assert a.shape[1] == action_dim, (
-        #     f"Action dim mismatch: {a.shape[1]} vs {action_dim}"
-        # )
-        # assert s.shape[1] == obs.shape[1], (
-        #     f"Obs dim mismatch: {s.shape[1]} vs {obs.shape[1]}"
-        # )
 
         critic_loss, critic_gradients = nnx.value_and_grad(critic_loss_fn, argnums=0)(
             critic,
@@ -591,14 +689,11 @@ if __name__ == "__main__":
         # buffer_state_graphdef, buffer_state_tree = nnx.split(buffer_state)
 
         # cast back up
-        new_env_states.metrics["reward_ctrl"] = new_env_states.metrics[
-            "reward_ctrl"
-        ].astype(jnp.float32)
+        # No need to cast metrics with RepairsEnv
 
         return (
             (
-                new_env_states,
-                (new_video_obs, new_robot_obs, voxel_obs),
+                (new_video_obs, new_electronic_graph_obs, voxel_obs),
                 nnx.State(buffer_state),
                 rngs,
                 actor,
@@ -635,6 +730,8 @@ if __name__ == "__main__":
     sum_rewards_where_done = jnp.sum(rewards, axis=0, where=dones[:, None])
     mean_of_cumulative_rewards = sum_rewards_where_done.mean(axis=-1)
     # smoothed_out_rewards = jnp.reshape(-1, 20).mean().ravel()
+
+    # Simplified episode length calculation
     _, episode_lengths = jax.vmap(
         lambda r, d: jax.lax.scan(
             lambda c, x: jax.lax.cond(
@@ -778,4 +875,3 @@ if __name__ == "__main__":
     for _ in range(1000):
         rollout.append(state.pipeline_state)
         state = inference_fn(actor, state, rngs)
-    HTML(html.render(env.sys.tree_replace({"opt.timestep": env.dt}), rollout))
