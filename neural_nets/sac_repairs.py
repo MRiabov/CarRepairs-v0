@@ -1,3 +1,4 @@
+import dataclasses
 import os
 import pathlib
 import time
@@ -332,6 +333,7 @@ if __name__ == "__main__":
         sample_batch_size=sample_batch_size,
         add_batch_size=batch_size,
     )
+    # todo buffer replace with jit donate argnums
     buffer_state = buffer.init(
         {
             "video_obs": jnp.zeros(vision_obs_dim, dtype=jnp.uint8),
@@ -345,7 +347,9 @@ if __name__ == "__main__":
             "done": jnp.zeros((), jnp.bool_),
         }
     )
-    # NOTE: correct order of observations: video, robot, voxel. Everything else is a mistake.
+    # NOTE: correct order of observations: video, electronics_graph, voxel (id). Everything else is a mistake.
+    # NOTE: this is necessary because tldr: buffer donation. It's expected by flashbax.
+    buffer_add = jax.jit(buffer.add, donate_argnums=0)
 
     actor = SACActor(
         action_dim=action_dim,
@@ -367,6 +371,8 @@ if __name__ == "__main__":
             video_obs = jax.dlpack.from_dlpack(
                 obs
             )  # note: it calls __dlpack__ under the hood, so no need to call it here.
+            # note 2: don't know why but from_dlpack returns a tuple (here), so we need to access the first element.
+
             return video_obs  # it also returns the desired state...
 
         stub_graph_obs = jnp.zeros((batch_size, 10), jnp.bool)
@@ -401,7 +407,10 @@ if __name__ == "__main__":
             # Convert torch tensors to numpy arrays
             video_obs = jax.dlpack.from_dlpack(
                 obs
-            )  # note: torch tensors are already dlpack tensors, so no need to call __dlpack__.
+            )[
+                0
+            ]  # note: torch tensors are already dlpack tensors, so no need to call __dlpack__.
+            # note 2: don't know why but from_dlpack returns a tuple (here), so we need to access the first element.
             rewards = jax.dlpack.from_dlpack(rewards)
             dones = jax.dlpack.from_dlpack(dones)
             # Return observations, rewards, dones in expected format
@@ -429,7 +438,7 @@ if __name__ == "__main__":
         )
 
     # Initialize environment - only need to get observations
-    video_obs = env_reset()
+    video_obs, electronics_graph_obs = env_reset()
     # Initialize voxel observations with zeros # placeholder
     voxel_obs = jnp.zeros((batch_size,) + voxel_obs_dim, dtype=jnp.int8)
 
@@ -482,7 +491,7 @@ if __name__ == "__main__":
     @partial(jax.jit, donate_argnums=(0,))
     def fill_buffer_step(carry, _):
         (
-            buffer_env_states,
+            # buffer_env_states,
             (
                 prev_video_obs,
                 prev_electronics_graph_obs,
@@ -495,10 +504,14 @@ if __name__ == "__main__":
         rng, action_rng, step_rng = jax.random.split(rng, 3)
 
         random_actions = jax.random.uniform(
-            action_rng, shape=(batch_size, env.action_size), minval=-1.0, maxval=1.0
+            action_rng,
+            shape=(batch_size, action_dim),
+            minval=-1.0,
+            maxval=1.0,
+            dtype=jnp.bfloat16,
         )
 
-        new_obs, electronics_graph_obs, rewards, dones, _infos = env_step(
+        new_video_obs, new_electronics_graph_obs, rewards, dones, _infos = env_step(
             random_actions
         )
 
@@ -507,13 +520,15 @@ if __name__ == "__main__":
         # new_electronics_graph_obs = jnp.where(
         #     dones[:, None], reset_electronics_graph_obs, electronics_graph_obs
         # ) # done by torch, implicitly.
+        print(prev_video_obs)
+        print(prev_electronics_graph_obs.shape)
 
-        buffer_state = buffer.add(
+        buffer_state = buffer_add(
             buffer_state,
             {
-                "video_obs": new_obs,
-                "electronics_graph_obs": electronics_graph_obs,
-                # "voxel_obs": prev_obs,
+                "video_obs": prev_video_obs,
+                "electronics_graph_obs": prev_electronics_graph_obs,
+                # "voxel_obs": prev_obs, # should be by id, or else it would blow up memory.
                 "action": random_actions,
                 "reward": rewards,
                 "done": dones.astype(jnp.bool_),
@@ -521,7 +536,7 @@ if __name__ == "__main__":
         )
 
         return (
-            buffer_env_states,
+            # buffer_env_states, # no env states in jax now.
             (new_video_obs, new_electronics_graph_obs),
             buffer_state,
             rng,
@@ -530,7 +545,10 @@ if __name__ == "__main__":
     # With the RepairsEnv, environment state is managed internally by the environment
     # We only need to track observations
     fill_buffer_carry = (
-        (video_obs, electronics_graph_obs),
+        (
+            video_obs[0] if isinstance(video_obs, tuple) else video_obs,
+            electronics_graph_obs,
+        ),
         buffer_state,
         rngs.env(),
     )
@@ -540,7 +558,7 @@ if __name__ == "__main__":
         fill_buffer_step, fill_buffer_carry, None, length=fill_steps
     )
 
-    obs, buffer_state, env_rng = fill_buffer_carry
+    (video_obs, electronics_graph_obs), buffer_state, env_rng = fill_buffer_carry
     reset_video_obs, reset_electronic_graph_obs = env_reset(batch_rng)
     reset_obs = (reset_video_obs, reset_electronic_graph_obs)
 
@@ -624,7 +642,7 @@ if __name__ == "__main__":
         # voxel obs is static (yet)
 
         # Environment state handling is now managed by RepairsEnv
-        buffer_state = buffer.add(
+        buffer_state = buffer_add(
             buffer_state,
             {
                 "video_obs": prev_video_obs,
@@ -731,7 +749,6 @@ if __name__ == "__main__":
                 actor_optimizer,
                 critic_optimizer,
                 alpha_opt_state,
-                # buffer,
                 episode_cumulative_reward,
             ),
             critic_loss,
@@ -805,7 +822,8 @@ if __name__ == "__main__":
         experience={
             "action": experience["action"],
             "done": experience["done"],
-            "obs": experience["obs"],
+            "video_obs": experience["video_obs"],
+            "electronics_graph_obs": experience["electronics_graph_obs"],
             "reward": experience["reward"],
         },
         current_index=buffer_state.current_index,
@@ -882,7 +900,7 @@ if __name__ == "__main__":
     plt.legend()
     plt.xlabel("Step")
     plt.ylabel("Reward")
-    plt.title("Brax Ant Evaluation Episode Reward Sequence")
+    plt.title("Repairs Evaluation Episode Reward Sequence")
     plt.show()
 
     actor.eval()
