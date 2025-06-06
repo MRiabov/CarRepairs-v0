@@ -274,6 +274,9 @@ if __name__ == "__main__":
             "finger_joint1": 0.04,
             "finger_joint2": 0.04,
         },
+        "dataloader_settings":{
+            "prefetch_memory_size":256 # 256 environments per scene.
+        }
     }
 
     obs_cfg = {
@@ -289,19 +292,6 @@ if __name__ == "__main__":
 
     command_cfg = {}
 
-    # Create gym environment
-    print("Creating gym environment...")
-    env = RepairsEnv(
-        env_setup=env_setup,
-        tasks=[task],
-        num_envs=2,
-        env_cfg=env_cfg,
-        obs_cfg=obs_cfg,
-        reward_cfg=reward_cfg,
-        command_cfg=command_cfg,
-        show_viewer=True,
-        num_scenes_per_task=1,
-    )
     action_dim = env_cfg["num_actions"]
     num_cameras = 2
     vision_obs_dim = (
@@ -321,6 +311,21 @@ if __name__ == "__main__":
     min_buffer_len = 5000
     # ^46gb at 2*256*256*7*int8 res!!!
     sample_batch_size = 256
+
+    # Create gym environment
+    print("Creating gym environment...")
+    env = RepairsEnv(
+        env_setups=[env_setup],
+        tasks=[task],
+        env_cfg=env_cfg,
+        obs_cfg=obs_cfg,
+        reward_cfg=reward_cfg,
+        command_cfg=command_cfg,
+        show_viewer=True,
+        num_scenes_per_task=1,
+        batch_dim=batch_size,
+    )
+    
 
     rngs = nnx.Rngs(0, action=1, env=2, buffer=3)
 
@@ -619,11 +624,12 @@ if __name__ == "__main__":
             is_full=buffer_state.is_full,
         )
 
-        batch_rng = jax.random.split(rngs.env(), batch_size)
         action, _log_prob = actor.sample_action(
             prev_video_obs, prev_electronic_graph_obs, voxel_obs, rngs
         )
 
+        #note: this includes both the step and reset.
+        #returns the reset obs if done is called.
         video_obs, electronic_graph_obs, reward, done, _infos = env_step(action)
         assert video_obs.shape == video_obs.shape, (
             f"Obs dim mismatch: {video_obs.shape} vs {video_obs.shape}"
@@ -633,8 +639,7 @@ if __name__ == "__main__":
             done, 0.0, episode_cumulative_reward + reward
         )
 
-        batch_rng = jax.random.split(rngs.env(), batch_size)
-        reset_video_obs, reset_robot_obs = env_reset(batch_rng)
+        reset_video_obs, reset_robot_obs = env_reset()
         new_video_obs = jnp.where(done[:, None], reset_video_obs, video_obs)
         new_electronic_graph_obs = jnp.where(
             done[:, None], reset_robot_obs, electronic_graph_obs
