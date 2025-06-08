@@ -249,6 +249,8 @@ if __name__ == "__main__":
     task = AssembleTask()
     env_setup = MoveBoxSetup()
 
+    debug=True
+
     # Environment configuration
     env_cfg = {
         "num_actions": 9,  # [x, y, z, quat_w, quat_x, quat_y, quat_z, gripper_force_left, gripper_force_right]
@@ -274,9 +276,17 @@ if __name__ == "__main__":
             "finger_joint1": 0.04,
             "finger_joint2": 0.04,
         },
-        "dataloader_settings":{
-            "prefetch_memory_size":256 # 256 environments per scene.
-        }
+        "dataloader_settings": {
+            "prefetch_memory_size": 256  # 256 environments per scene.
+        },
+        "min_bounds": (-0.6, -0.7, -0.1),
+        "max_bounds": (0.5, 0.5, 2),
+        "save_obs": {
+            "video": True,
+            "voxel": True,
+            "electronic_graph": True,
+            "path": "./obs/",
+        },
     }
 
     obs_cfg = {
@@ -304,9 +314,10 @@ if __name__ == "__main__":
     voxel_obs_dim = (2, 256, 256, 256)  # start and finish # should be sparse?
 
     batch_size = (
-        1  # 16 if jax.default_backend() == "cpu" else 64  # 256 # note:debug atm.
+        4  # 16 if jax.default_backend() == "cpu" else 64  # 256 # note:debug atm.
     )
-    train_steps = (10_000_000 if jax.default_backend() == "gpu" else 3000) // batch_size
+    train_steps = (10_000_000 if jax.default_backend() == "gpu" and not debug else 3000) // batch_size
+    # train_steps = (10_000_000 if jax.default_backend() == "gpu" else 3000) // batch_size
     buffer_size = 10000  # was 200_000, reduced due to GPU constraints.
     min_buffer_len = 5000
     # ^46gb at 2*256*256*7*int8 res!!!
@@ -325,7 +336,6 @@ if __name__ == "__main__":
         num_scenes_per_task=1,
         batch_dim=batch_size,
     )
-    
 
     rngs = nnx.Rngs(0, action=1, env=2, buffer=3)
 
@@ -368,33 +378,36 @@ if __name__ == "__main__":
 
     target_entropy = -action_dim
 
-    # Using pure_callback to interface with PyTorch-based RepairsEnv
-    def env_reset():  # key: jax.Array
-        # Function to reset environment in PyTorch land
-        def _reset_impl():  # rng_key: jax.Array # no trouble with no deterministic rng.
-            obs, info = env.reset()
-            video_obs = jax.dlpack.from_dlpack(
-                obs
-            )  # note: it calls __dlpack__ under the hood, so no need to call it here.
-            # note 2: don't know why but from_dlpack returns a tuple (here), so we need to access the first element.
+    # reset won't happen in jax easily because we don't want to strain the dataloader, and fixed batch size.
+    # simply use env_step instead.
 
-            return video_obs  # it also returns the desired state...
+    # # Using pure_callback to interface with PyTorch-based RepairsEnv
+    # def env_reset():  # key: jax.Array
+    #     # Function to reset environment in PyTorch land
+    #     def _reset_impl():  # rng_key: jax.Array # no trouble with no deterministic rng.
+    #         obs, info = env.reset()
+    #         video_obs = jax.dlpack.from_dlpack(
+    #             obs
+    #         )  # note: it calls __dlpack__ under the hood, so no need to call it here.
+    #         # note 2: don't know why but from_dlpack returns a tuple (here), so we need to access the first element.
 
-        stub_graph_obs = jnp.zeros((batch_size, 10), jnp.bool)
-        # Convert back to JAX arrays
-        return (
-            jax.pure_callback(
-                _reset_impl,
-                (
-                    jax.ShapeDtypeStruct(
-                        shape=(batch_size, len(env.cameras), *env.obs_cfg["res"], 7),
-                        dtype=jnp.uint8,
-                    ),
-                    # here: electronics_obs and others.
-                ),
-            ),
-            stub_graph_obs,
-        )  # note: hmm, could it not guarantee the execution loop? it could be a problem.
+    #         return video_obs  # it also returns the desired state...
+
+    #     stub_graph_obs = jnp.zeros((batch_size, 10), jnp.bool)
+    #     # Convert back to JAX arrays
+    #     return (
+    #         jax.pure_callback(
+    #             _reset_impl,
+    #             (
+    #                 jax.ShapeDtypeStruct(
+    #                     shape=(batch_size, num_cameras, *env.obs_cfg["res"], 7),
+    #                     dtype=jnp.uint8,
+    #                 ),
+    #                 # here: electronics_obs and others.
+    #             ),
+    #         ),
+    #         stub_graph_obs,
+    #     )  # note: hmm, could it not guarantee the execution loop? it could be a problem.
 
     def env_step(
         actions: jax.Array,
@@ -410,13 +423,8 @@ if __name__ == "__main__":
             # Execute step in environment
             obs, rewards, dones, info = env.step(actions_torch)
             # Convert torch tensors to numpy arrays
-            video_obs = jax.dlpack.from_dlpack(
-                obs
-            )[
-                0
-            ]  # note: torch tensors are already dlpack tensors, so no need to call __dlpack__.
-            # note 2: don't know why but from_dlpack returns a tuple (here), so we need to access the first element.
-            rewards = jax.dlpack.from_dlpack(rewards)
+            video_obs = jax.dlpack.from_dlpack(obs)
+            rewards = jax.dlpack.from_dlpack(rewards).astype(jnp.bfloat16)
             dones = jax.dlpack.from_dlpack(dones)
             # Return observations, rewards, dones in expected format
             electronics_graph_obs = jnp.zeros(
@@ -442,8 +450,14 @@ if __name__ == "__main__":
             actions,
         )
 
-    # Initialize environment - only need to get observations
-    video_obs, electronics_graph_obs = env_reset()
+    # # Initialize environment - only need to get observations
+    # video_obs, electronics_graph_obs = env_reset() # worked in jax but no need for it here.
+    video_obs = jnp.zeros((batch_size,) + vision_obs_dim, dtype=jnp.uint8)
+    electronics_graph_obs = jnp.zeros(
+        (batch_size,) + electronics_graph_dim,
+        dtype=jnp.bool,  # bool for now
+    )  # just mock it with zeros. It will be reset on fill_buffer_step.
+
     # Initialize voxel observations with zeros # placeholder
     voxel_obs = jnp.zeros((batch_size,) + voxel_obs_dim, dtype=jnp.int8)
 
@@ -628,8 +642,8 @@ if __name__ == "__main__":
             prev_video_obs, prev_electronic_graph_obs, voxel_obs, rngs
         )
 
-        #note: this includes both the step and reset.
-        #returns the reset obs if done is called.
+        # note: this includes both the step and reset.
+        # returns the reset obs if done is called.
         video_obs, electronic_graph_obs, reward, done, _infos = env_step(action)
         assert video_obs.shape == video_obs.shape, (
             f"Obs dim mismatch: {video_obs.shape} vs {video_obs.shape}"
