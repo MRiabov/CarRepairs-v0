@@ -6,7 +6,7 @@ import flax
 import jax
 import jax.numpy as jnp
 import numpy as np
-from repairs_components.processing.tasks import AssembleTask
+from repairs_components.processing.tasks import AssembleTask, DisassembleTask
 import torch
 import optax
 from flax import nnx
@@ -246,10 +246,10 @@ if __name__ == "__main__":
     gs.init(backend=gs.cuda)
 
     # Create task and environment setup
-    task = AssembleTask()
+    tasks = [AssembleTask(), DisassembleTask()]
     env_setup = MoveBoxSetup()
 
-    debug=True
+    debug = True
 
     # Environment configuration
     env_cfg = {
@@ -282,9 +282,13 @@ if __name__ == "__main__":
         "min_bounds": (-0.6, -0.7, -0.1),
         "max_bounds": (0.5, 0.5, 2),
         "save_obs": {
-            "video": True,
-            "voxel": True,
-            "electronic_graph": True,
+            # "video": True,
+            # "voxel": True,
+            # "electronic_graph": True,
+            # "path": "./obs/",
+            "video": False,  # not flooding the disk..
+            "voxel": False,
+            "electronic_graph": False,
             "path": "./obs/",
         },
     }
@@ -314,12 +318,16 @@ if __name__ == "__main__":
     voxel_obs_dim = (2, 256, 256, 256)  # start and finish # should be sparse?
 
     batch_size = (
-        4  # 16 if jax.default_backend() == "cpu" else 64  # 256 # note:debug atm.
+        128  # 16 if jax.default_backend() == "cpu" else 64  # 256 # note:debug atm.
     )
-    train_steps = (10_000_000 if jax.default_backend() == "gpu" and not debug else 3000) // batch_size
+    train_steps = (
+        10_000_000 if jax.default_backend() == "gpu" and not debug else 3000
+    ) // batch_size
     # train_steps = (10_000_000 if jax.default_backend() == "gpu" else 3000) // batch_size
-    buffer_size = 10000  # was 200_000, reduced due to GPU constraints.
-    min_buffer_len = 5000
+    buffer_size = (
+        500 if debug else 200_000
+    )  # was 200_000, reduced due to GPU constraints.
+    min_buffer_len = 300 if debug else 10_000
     # ^46gb at 2*256*256*7*int8 res!!!
     sample_batch_size = 256
 
@@ -327,7 +335,7 @@ if __name__ == "__main__":
     print("Creating gym environment...")
     env = RepairsEnv(
         env_setups=[env_setup],
-        tasks=[task],
+        tasks=tasks,
         env_cfg=env_cfg,
         obs_cfg=obs_cfg,
         reward_cfg=reward_cfg,
@@ -380,34 +388,6 @@ if __name__ == "__main__":
 
     # reset won't happen in jax easily because we don't want to strain the dataloader, and fixed batch size.
     # simply use env_step instead.
-
-    # # Using pure_callback to interface with PyTorch-based RepairsEnv
-    # def env_reset():  # key: jax.Array
-    #     # Function to reset environment in PyTorch land
-    #     def _reset_impl():  # rng_key: jax.Array # no trouble with no deterministic rng.
-    #         obs, info = env.reset()
-    #         video_obs = jax.dlpack.from_dlpack(
-    #             obs
-    #         )  # note: it calls __dlpack__ under the hood, so no need to call it here.
-    #         # note 2: don't know why but from_dlpack returns a tuple (here), so we need to access the first element.
-
-    #         return video_obs  # it also returns the desired state...
-
-    #     stub_graph_obs = jnp.zeros((batch_size, 10), jnp.bool)
-    #     # Convert back to JAX arrays
-    #     return (
-    #         jax.pure_callback(
-    #             _reset_impl,
-    #             (
-    #                 jax.ShapeDtypeStruct(
-    #                     shape=(batch_size, num_cameras, *env.obs_cfg["res"], 7),
-    #                     dtype=jnp.uint8,
-    #                 ),
-    #                 # here: electronics_obs and others.
-    #             ),
-    #         ),
-    #         stub_graph_obs,
-    #     )  # note: hmm, could it not guarantee the execution loop? it could be a problem.
 
     def env_step(
         actions: jax.Array,
@@ -539,8 +519,8 @@ if __name__ == "__main__":
         # new_electronics_graph_obs = jnp.where(
         #     dones[:, None], reset_electronics_graph_obs, electronics_graph_obs
         # ) # done by torch, implicitly.
-        print(prev_video_obs)
-        print(prev_electronics_graph_obs.shape)
+        # print(prev_video_obs)
+        # print(prev_electronics_graph_obs.shape)
 
         buffer_state = buffer_add(
             buffer_state,
@@ -573,19 +553,19 @@ if __name__ == "__main__":
     )
 
     fill_steps = min_buffer_len // batch_size
-    fill_buffer_carry, _ = jax.lax.scan(
+    ((video_obs, electronics_graph_obs), buffer_state, env_rng), _ = jax.lax.scan(
         fill_buffer_step, fill_buffer_carry, None, length=fill_steps
     )
 
-    (video_obs, electronics_graph_obs), buffer_state, env_rng = fill_buffer_carry
-    reset_video_obs, reset_electronic_graph_obs = env_reset(batch_rng)
-    reset_obs = (reset_video_obs, reset_electronic_graph_obs)
+    # (video_obs, electronics_graph_obs), buffer_state, env_rng = fill_buffer_carry
+    # reset_video_obs, reset_electronic_graph_obs = env_reset(batch_rng)
+    # reset_obs = (reset_video_obs, reset_electronic_graph_obs)
 
     batch_rng = jax.random.split(env_rng, batch_size)
 
     carry = (
         # None,  # No need to track env states explicitly
-        reset_obs,
+        (video_obs, electronics_graph_obs),
         nnx.State(buffer_state),
         rngs,
         actor,
@@ -874,18 +854,17 @@ if __name__ == "__main__":
             rng, action_rng = jax.random.split(rng)
             rngs_step = nnx.Rngs(rng, action=action_rng)
             # sample action
-            action, _ = actor.sample_action(state.obs[None, :], rngs_step)
-            action = jnp.squeeze(action, axis=0)
-            # step environment
-            next_state = env.step(state, action)
+            action, _ = actor.sample_action(state.obs, rngs_step)
+            # take one step across all batched environments
+            state = env.step(state, action)
             # cast up because it throws otherwise.
-            next_state.metrics["reward_ctrl"] = next_state.metrics[
-                "reward_ctrl"
-            ].astype(jnp.float32)
+            state.metrics["reward_ctrl"] = state.metrics["reward_ctrl"].astype(
+                jnp.float32
+            )
 
             return (
-                next_state,
-                total_reward + next_state.reward,
+                state,
+                total_reward + state.reward,
                 steps + 1,
                 rng,
             )
@@ -921,21 +900,3 @@ if __name__ == "__main__":
     plt.ylabel("Reward")
     plt.title("Repairs Evaluation Episode Reward Sequence")
     plt.show()
-
-    actor.eval()
-
-    @nnx.jit
-    def inference_fn(actor, state, rngs):
-        action, _ = actor.sample_action(state.obs[None, :], rngs)
-        state = env.step(state, action[0])
-        return state
-
-    # create an env with auto-reset
-    jit_env_reset = jax.jit(env.reset)
-    jit_env_step = jax.jit(env.step)
-    rollout = []
-
-    state = jit_env_reset(rngs.env())
-    for _ in range(1000):
-        rollout.append(state.pipeline_state)
-        state = inference_fn(actor, state, rngs)

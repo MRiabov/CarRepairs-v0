@@ -1,17 +1,17 @@
 {
     "version": "0.2.0",
     "configurations": [
+        
+        
+
         {
-            "name": "Run Tooling Demo",
+            "name": "Run SAC repairs",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/examples/tooling_demo.py",
+            "program": "${workspaceFolder}/neural_nets/sac_repairs.py",
             "console": "integratedTerminal",
             "justMyCode": true,
             "cwd": "${workspaceFolder}",
-            "env": {
-                "PYTHONPATH": "${workspaceFolder}:${env:PYTHONPATH}"
-            }
-        }
+        },
     ]
 }
