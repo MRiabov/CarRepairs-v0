@@ -7,6 +7,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchrl.data.replay_buffers import TensorDictReplayBuffer, TensorStorage
+from torch_geometric.data import Batch, Data    
+from graphs import GraphEncoder
+
 
 
 class SACActor(nn.Module):
@@ -33,20 +36,28 @@ class SACActor(nn.Module):
         self.fc2 = nn.Linear(256, 256)
         self.out_mean = nn.Linear(256, action_dim)
         self.out_log_std = nn.Linear(256, action_dim)
+        self.graph_encoder = GraphEncoder(216, 256, electronics_graph_dim, heads=2)
 
-    def forward(self, voxel_obs, video_obs, graph_obs):
+    def forward(self, voxel_obs, video_obs, graph_obs:Batch):
+        #TODO add support for mech graphs.
+
         # assume voxel_obs shape [B, 1, D, H, W]
         x_v = F.silu(self.voxel_conv1(voxel_obs))
         x_v = F.silu(self.voxel_conv2(x_v))
         x_v = F.silu(self.voxel_conv3(x_v))
         x_v = x_v.view(x_v.size(0), -1)
+
         # assume video_obs shape [B, C, H, W]
         x_vid = F.silu(self.video_conv1(video_obs))
         x_vid = F.silu(self.video_conv2(x_vid))
         x_vid = F.silu(self.video_conv3(x_vid))
         x_vid = x_vid.view(x_vid.size(0), -1)
+
+        #observe graphs:
+        encoded_graph = self.graph_encoder(graph_obs) # not x_graph because graphs have their own x
+
         # concatenate all features
-        x = torch.cat([x_v, x_vid, graph_obs], dim=-1)
+        x = torch.cat([x_v, x_vid, encoded_graph], dim=-1)
         x = F.silu(self.fc1(x))
         x = F.silu(self.fc2(x))
         mean = self.out_mean(x)
