@@ -1,5 +1,7 @@
 import copy
 
+from examples.box_to_pos_task import MoveBoxSetup
+from genesis import gs
 import numpy as np
 import torch
 import torch.nn as nn
@@ -175,7 +177,7 @@ class SACTrainer:
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
         self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=alpha_lr)
         # TorchRL replay buffer
-        tensordict = {
+        tensor_dict = {
             "electronics_graph_obs": torch.zeros(
                 electronics_graph_dim,
                 dtype=torch.bool,  # bool for now
@@ -186,7 +188,7 @@ class SACTrainer:
             "done": torch.zeros((), dtype=torch.bool),
         }
         self.buffer_storage = TensorStorage(
-            storage=tensordict, max_size=buffer_size, device=self.device
+            storage=tensor_dict, max_size=buffer_size, device=self.device
         )
         self.replay_buffer = TensorDictReplayBuffer(
             storage=self.buffer_storage, batch_size=batch_size, sampler="random"
@@ -235,122 +237,6 @@ class SACTrainer:
 
 # end of SACTrainer
 
-# ===== Training Orchestrator =====
-def run_training(
-    env_setups,
-    tasks,
-    env_cfg,
-    obs_cfg,
-    reward_cfg,
-    command_cfg,
-    batch_dim,
-    action_dim,
-    electronics_graph_dim,
-    num_steps=10000,
-    prefill_steps=1000,
-):
-    """
-    Orchestrates environment interaction, replay buffer filling, and training steps.
-    """
-    from repairs_components.training_utils.gym_env import RepairsEnv
-
-    env = RepairsEnv(
-        env_setups=env_setups,
-        tasks=tasks,
-        batch_dim=batch_dim,
-        env_cfg=env_cfg,
-        obs_cfg=obs_cfg,
-        reward_cfg=reward_cfg,
-        command_cfg=command_cfg,
-    )
-    trainer = SACTrainer(action_dim, electronics_graph_dim)
-
-    obs, _ = env.reset()
-    voxel_obs, video_obs, graph_obs = obs
-
-    # Prefill buffer with random actions
-    for _ in range(prefill_steps):
-        rand_action = torch.randn(batch_dim, action_dim, device=trainer.device)
-        next_obs, reward, done, _ = env.step(rand_action)
-        nv, nvid, ng = next_obs
-        trainer.replay_buffer.add({
-            "voxel_obs": voxel_obs,
-            "video_obs": video_obs,
-            "electronics_graph_obs": graph_obs,
-            "action": rand_action,
-            "reward": reward,
-            "done": done,
-            "next_voxel_obs": nv,
-            "next_video_obs": nvid,
-            "next_electronics_graph_obs": ng,
-        })
-        voxel_obs, video_obs, graph_obs = nv, nvid, ng
-
-    # Main training loop
-    for step in range(num_steps):
-        action = trainer.select_action(voxel_obs, video_obs, graph_obs)
-        next_obs, reward, done, _ = env.step(action)
-        nv, nvid, ng = next_obs
-        trainer.replay_buffer.add({
-            "voxel_obs": voxel_obs,
-            "video_obs": video_obs,
-            "electronics_graph_obs": graph_obs,
-            "action": action.to(trainer.device),
-            "reward": reward,
-            "done": done,
-            "next_voxel_obs": nv,
-            "next_video_obs": nvid,
-            "next_electronics_graph_obs": ng,
-        })
-        if step >= prefill_steps:
-            batch = trainer.replay_buffer.sample()
-            cl, al, alpha = trainer.update(
-                (
-                    batch["voxel_obs"],
-                    batch["video_obs"],
-                    batch["electronics_graph_obs"],
-                    batch["action"],
-                    batch["reward"],
-                    batch["next_voxel_obs"],
-                    batch["next_video_obs"],
-                    batch["next_electronics_graph_obs"],
-                    batch["done"],
-                )
-            )
-            if step % 1000 == 0:
-                print(f"Step {step}: critic_loss={cl}, actor_loss={al}, alpha={alpha}")
-        voxel_obs, video_obs, graph_obs = nv, nvid, ng
-
-if __name__ == "__main__":
-    # Configure environment and tasks
-    from repairs_components.processing.tasks import AssembleTask, DisassembleTask
-    # TODO: import your EnvSetup class for environment configurations
-
-    env_setups = []  # e.g., [EnvSetup(...), ...]
-    tasks = [AssembleTask(), DisassembleTask()]
-
-    # Configuration placeholders
-    env_cfg = {}
-    obs_cfg = {}
-    reward_cfg = {}
-    command_cfg = {}
-
-    # Training parameters
-    batch_dim = 16
-    action_dim = 7
-    electronics_graph_dim = 128
-
-    run_training(
-        env_setups,
-        tasks,
-        env_cfg,
-        obs_cfg,
-        reward_cfg,
-        command_cfg,
-        batch_dim,
-        action_dim,
-        electronics_graph_dim,
-    )
 
 # ===== Training Orchestrator =====
 def run_training(
@@ -385,249 +271,11 @@ def run_training(
     obs, _ = env.reset()
     voxel_obs, video_obs, graph_obs = obs
 
-    # Prefill with random
+    # Prefill replay buffer
     for _ in range(prefill_steps):
         rand_action = torch.randn(batch_dim, action_dim, device=trainer.device)
         next_obs, reward, done, _ = env.step(rand_action)
         nv, nvid, ng = next_obs
-        trainer.replay_buffer.add({
-            "voxel_obs": voxel_obs,
-            "video_obs": video_obs,
-            "electronics_graph_obs": graph_obs,
-            "action": rand_action,
-            "reward": reward,
-            "done": done,
-            "next_voxel_obs": nv,
-            "next_video_obs": nvid,
-            "next_electronics_graph_obs": ng,
-        })
-        voxel_obs, video_obs, graph_obs = nv, nvid, ng
-
-    # Main training loop
-    for step in range(num_steps):
-        action = trainer.select_action(voxel_obs, video_obs, graph_obs)
-        next_obs, reward, done, _ = env.step(action)
-        nv, nvid, ng = next_obs
-        trainer.replay_buffer.add({
-            "voxel_obs": voxel_obs,
-            "video_obs": video_obs,
-            "electronics_graph_obs": graph_obs,
-            "action": action.to(trainer.device),
-            "reward": reward,
-            "done": done,
-            "next_voxel_obs": nv,
-            "next_video_obs": nvid,
-            "next_electronics_graph_obs": ng,
-        })
-        if step >= prefill_steps:
-            batch = trainer.replay_buffer.sample()
-            cl, al, alpha = trainer.update(
-                (
-                    batch["voxel_obs"],
-                    batch["video_obs"],
-                    batch["electronics_graph_obs"],
-                    batch["action"],
-                    batch["reward"],
-                    batch["next_voxel_obs"],
-                    batch["next_video_obs"],
-                    batch["next_electronics_graph_obs"],
-                    batch["done"],
-                )
-            )
-            if step % 1000 == 0:
-                print(f"Step {step}: critic_loss={cl}, actor_loss={al}, alpha={alpha}")
-        voxel_obs, video_obs, graph_obs = nv, nvid, ng
-
-if __name__ == "__main__":
-    # Configure environment and tasks
-    from repairs_components.processing.tasks import AssembleTask, DisassembleTask
-    # TODO: import your EnvSetup class to configure env_setups
-
-    # TODO: Populate env_setups with your environment setup instances
-    env_setups = []  # e.g., [EnvSetup(...), ...]
-    tasks = [AssembleTask(), DisassembleTask()]
-
-    # TODO: Define your configuration dictionaries
-    env_cfg = {}
-    obs_cfg = {}
-    reward_cfg = {}
-    command_cfg = {}
-
-    # Training parameters
-    batch_dim = 16
-    action_dim = 7
-    electronics_graph_dim = 128
-
-    # Start training
-    run_training(
-        env_setups,
-        tasks,
-        env_cfg,
-        obs_cfg,
-        reward_cfg,
-        command_cfg,
-        batch_dim,
-        action_dim,
-        electronics_graph_dim,
-    )
-
-# ===== Training Orchestrator =====
-def run_training(
-    env_setups,
-    tasks,
-    env_cfg,
-    obs_cfg,
-    reward_cfg,
-    command_cfg,
-    batch_dim,
-    action_dim,
-    electronics_graph_dim,
-    num_steps=10000,
-    prefill_steps=1000,
-):
-    """
-    Orchestrates environment interaction, replay buffer filling, and training steps.
-    """
-    from repairs_components.training_utils.gym_env import RepairsEnv
-
-    env = RepairsEnv(
-        env_setups=env_setups,
-        tasks=tasks,
-        batch_dim=batch_dim,
-        env_cfg=env_cfg,
-        obs_cfg=obs_cfg,
-        reward_cfg=reward_cfg,
-        command_cfg=command_cfg,
-    )
-    trainer = SACTrainer(action_dim, electronics_graph_dim)
-
-    obs, _ = env.reset()
-    voxel_obs, video_obs, graph_obs = obs
-
-    # Prefill
-    for _ in range(prefill_steps):
-        rand_action = torch.randn(batch_dim, action_dim, device=trainer.device)
-        next_obs, reward, done, _ = env.step(rand_action)
-        nv, nvid, ng = next_obs
-        trainer.replay_buffer.add({
-            "voxel_obs": voxel_obs,
-            "video_obs": video_obs,
-            "electronics_graph_obs": graph_obs,
-            "action": rand_action,
-            "reward": reward,
-            "done": done,
-            "next_voxel_obs": nv,
-            "next_video_obs": nvid,
-            "next_electronics_graph_obs": ng,
-        })
-        voxel_obs, video_obs, graph_obs = nv, nvid, ng
-
-    # Training loop
-    for step in range(num_steps):
-        action = trainer.select_action(voxel_obs, video_obs, graph_obs)
-        next_obs, reward, done, _ = env.step(action)
-        nv, nvid, ng = next_obs
-        trainer.replay_buffer.add({
-            "voxel_obs": voxel_obs,
-            "video_obs": video_obs,
-            "electronics_graph_obs": graph_obs,
-            "action": action.to(trainer.device),
-            "reward": reward,
-            "done": done,
-            "next_voxel_obs": nv,
-            "next_video_obs": nvid,
-            "next_electronics_graph_obs": ng,
-        })
-        if step >= prefill_steps:
-            batch = trainer.replay_buffer.sample()
-            cl, al, alpha = trainer.update(
-                (
-                    batch["voxel_obs"],
-                    batch["video_obs"],
-                    batch["electronics_graph_obs"],
-                    batch["action"],
-                    batch["reward"],
-                    batch["next_voxel_obs"],
-                    batch["next_video_obs"],
-                    batch["next_electronics_graph_obs"],
-                    batch["done"],
-                )
-            )
-            if step % 1000 == 0:
-                print(f"Step {step}: critic_loss={cl}, actor_loss={al}, alpha={alpha}")
-        voxel_obs, video_obs, graph_obs = nv, nvid, ng
-
-if __name__ == "__main__":
-    from repairs_components.processing.tasks import AssembleTask, DisassembleTask
-    from repairs_components.training_utils.env_setup import EnvSetup
-
-    # Setup environments and tasks
-    env_setups = []  # TODO: fill with EnvSetup instances
-    tasks = [AssembleTask(), DisassembleTask()]
-
-    # Config placeholders
-    env_cfg = {}
-    obs_cfg = {}
-    reward_cfg = {}
-    command_cfg = {}
-
-    batch_dim = 16
-    action_dim = 7
-    electronics_graph_dim = 128
-
-    run_training(
-        env_setups,
-        tasks,
-        env_cfg,
-        obs_cfg,
-        reward_cfg,
-        command_cfg,
-        batch_dim,
-        action_dim,
-        electronics_graph_dim,
-    )
-
-# ===== Training Orchestrator =====
-def run_training(
-    env_setups,
-    tasks,
-    env_cfg,
-    obs_cfg,
-    reward_cfg,
-    command_cfg,
-    batch_dim,
-    action_dim,
-    electronics_graph_dim,
-    num_steps=10000,
-    prefill_steps=1000,
-):
-    """
-    Orchestrates environment interaction, replay buffer filling, and training steps.
-    """
-    # Lazy import to avoid circular dependency
-    from repairs_components.training_utils.gym_env import RepairsEnv
-
-    # Initialize environment and trainer
-    env = RepairsEnv(
-        env_setups=env_setups,
-        tasks=tasks,
-        batch_dim=batch_dim,
-        env_cfg=env_cfg,
-        obs_cfg=obs_cfg,
-        reward_cfg=reward_cfg,
-        command_cfg=command_cfg,
-    )
-    trainer = SACTrainer(action_dim, electronics_graph_dim)
-
-    # Reset env
-    obs, _ = env.reset()
-    voxel_obs, video_obs, graph_obs = obs
-
-    # Prefill buffer with random actions
-    for _ in range(prefill_steps):
-        rand_action = torch.randn(batch_dim, action_dim, device=trainer.device)
-        next_obs, reward, done, _ = env.step(rand_action)
-        next_voxel, next_video, next_graph = next_obs
         trainer.replay_buffer.add(
             {
                 "voxel_obs": voxel_obs,
@@ -636,19 +284,18 @@ def run_training(
                 "action": rand_action,
                 "reward": reward,
                 "done": done,
-                "next_voxel_obs": next_voxel,
-                "next_video_obs": next_video,
-                "next_electronics_graph_obs": next_graph,
+                "next_voxel_obs": nv,
+                "next_video_obs": nvid,
+                "next_electronics_graph_obs": ng,
             }
         )
-        voxel_obs, video_obs, graph_obs = next_voxel, next_video, next_graph
+        voxel_obs, video_obs, graph_obs = nv, nvid, ng
 
     # Main training loop
     for step in range(num_steps):
-        # collect and train
         action = trainer.select_action(voxel_obs, video_obs, graph_obs)
         next_obs, reward, done, _ = env.step(action)
-        next_voxel, next_video, next_graph = next_obs
+        nv, nvid, ng = next_obs
         trainer.replay_buffer.add(
             {
                 "voxel_obs": voxel_obs,
@@ -657,9 +304,9 @@ def run_training(
                 "action": action.to(trainer.device),
                 "reward": reward,
                 "done": done,
-                "next_voxel_obs": next_voxel,
-                "next_video_obs": next_video,
-                "next_electronics_graph_obs": next_graph,
+                "next_voxel_obs": nv,
+                "next_video_obs": nvid,
+                "next_electronics_graph_obs": ng,
             }
         )
         if step >= prefill_steps:
@@ -679,112 +326,110 @@ def run_training(
             )
             if step % 1000 == 0:
                 print(f"Step {step}: critic_loss={cl}, actor_loss={al}, alpha={alpha}")
-        voxel_obs, video_obs, graph_obs = next_voxel, next_video, next_graph
+        voxel_obs, video_obs, graph_obs = nv, nvid, ng
+
 
 if __name__ == "__main__":
-    # Configure environment and tasks
+    # Example setup for training
     from repairs_components.processing.tasks import AssembleTask, DisassembleTask
-    from repairs_components.training_utils.env_setup import EnvSetup
 
-    # TODO: Populate env_setups with EnvSetup instances
-    env_setups = []  # e.g., [EnvSetup(...), ...]
+    # Initialize Genesis
+    gs.init(backend=gs.cuda)
+
+    # Create task and environment setup
     tasks = [AssembleTask(), DisassembleTask()]
+    env_setups = [MoveBoxSetup()]
 
-    # TODO: Define configuration dictionaries
+    debug = True
+
+    # Environment configuration
     env_cfg = {
-        # e.g., "num_actions": 7, "min_bounds": [...], "max_bounds": [...]
+        "num_actions": 9,  # [x, y, z, quat_w, quat_x, quat_y, quat_z, gripper_force_left, gripper_force_right]
+        "joint_names": [
+            "joint1",
+            "joint2",
+            "joint3",
+            "joint4",
+            "joint5",
+            "joint6",
+            "joint7",
+            "finger_joint1",
+            "finger_joint2",
+        ],
+        "default_joint_angles": {
+            "joint1": 0.0,
+            "joint2": -0.3,
+            "joint3": 0.0,
+            "joint4": -2.0,
+            "joint5": 0.0,
+            "joint6": 2.0,
+            "joint7": 0.79,  # no "hand" here? there definitely was hand.
+            "finger_joint1": 0.04,
+            "finger_joint2": 0.04,
+        },
+        "dataloader_settings": {
+            "prefetch_memory_size": 256  # 256 environments per scene.
+        },
+        "min_bounds": (-0.6, -0.7, -0.1),
+        "max_bounds": (0.5, 0.5, 2),
+        "save_obs": {
+            # "video": True,
+            # "voxel": True,
+            # "electronic_graph": True,
+            # "path": "./obs/",
+            "video": False,  # not flooding the disk..
+            "voxel": False,
+            "electronic_graph": False,
+            "path": "./obs/",
+        },
     }
+
     obs_cfg = {
-        # observation configuration
+        "num_obs": 3,  # RGB, depth, segmentation
+        "res": (256, 256),
     }
+
     reward_cfg = {
-        # reward configuration
-    }
-    command_cfg = {
-        # command input configuration
+        "success_reward": 10.0,
+        "progress_reward_scale": 1.0,
+        "progressive": True,  # TODO : if progressive, use progressive reward calc instead.
     }
 
-    # Training parameters
-    batch_dim = 16
-    action_dim = 7
-    electronics_graph_dim = 128
+    command_cfg = {}
 
-    # Start training
-    run_training(
-        env_setups,
-        tasks,
-        env_cfg,
-        obs_cfg,
-        reward_cfg,
-        command_cfg,
-        batch_dim,
-        action_dim,
-        electronics_graph_dim,
+    action_dim = env_cfg["num_actions"]
+    num_cameras = 2
+    vision_obs_dim = (
+        num_cameras,
+        256,
+        256,
+        7,
+    )  # 2 cameras, 7 channels (RGB, depth, segmentation)
+    electronics_graph_dim = (10,)  # fill in when ready
+    voxel_obs_dim = (2, 256, 256, 256)  # start and finish # should be sparse?
+
+    batch_size = (
+        128  # 16 if jax.default_backend() == "cpu" else 64  # 256 # note:debug atm.
     )
-    # Original tests...
-    # Dummy training step...
-    # Placeholder to run full training; configure env_setups and tasks below
-    # run_training(env_setups, tasks, env_cfg, obs_cfg, reward_cfg, command_cfg, batch_dim, action_dim, electronics_graph_dim)
-    pass
+    train_steps = (
+        10_000_000 if torch.cuda.is_available() and not debug else 3000
+    ) // batch_size
+    # train_steps = (10_000_000 if jax.default_backend() == "gpu" else 3000) // batch_size
+    buffer_size = (
+        500 if debug else 200_000
+    )  # was 200_000, reduced due to GPU constraints.
+    min_buffer_len = 300 if debug else 10_000
+    # ^46gb at 2*256*256*7*int8 res!!!
+    sample_batch_size = 256
 
-
-if __name__ == "__main__":
-    # Configure environment and tasks
-    from repairs_components.processing.tasks import AssembleTask, DisassembleTask
-    from repairs_components.training_utils.env_setup import EnvSetup
-
-    # TODO: Populate env_setups with EnvSetup instances
-    env_setups = []  # e.g., [EnvSetup(...), ...]
-    tasks = [AssembleTask(), DisassembleTask()]
-
-    # TODO: Define configuration dictionaries
-    env_cfg = {
-        # e.g., "num_actions": 7, "min_bounds": [...], "max_bounds": [...]
-    }
-    obs_cfg = {
-        # observation configuration
-    }
-    reward_cfg = {
-        # reward configuration
-    }
-    command_cfg = {
-        # command input configuration
-    }
-
-    # Training parameters
-    batch_dim = 16
-    action_dim = 7
-    electronics_graph_dim = 128
-
-    # Start training
     run_training(
-        env_setups,
-        tasks,
-        env_cfg,
-    # Unit tests for network shapes and sampling
-    action_dim = 7
-    electronics_graph_dim = 128
-    batch_size = 2
-    # Dummy inputs
-    voxel_obs = torch.randn(batch_size, 1, 32, 32, 32)
-    video_obs = torch.randn(batch_size, 3, 64, 64)
-    graph_obs = torch.randn(batch_size, electronics_graph_dim)
-    # Actor test
-    actor = SACActor(action_dim, electronics_graph_dim)
-    mean, log_std = actor(voxel_obs, video_obs, graph_obs)
-    action, log_prob = actor.sample_action(voxel_obs, video_obs, graph_obs)
-    # Critic test
-    critic = SACCritic(action_dim, electronics_graph_dim)
-    q1, q2 = critic(voxel_obs, video_obs, graph_obs, action)
-    # Print shapes
-    print("Actor output shapes: mean", mean.shape, ", log_std", log_std.shape)
-    print("Sampled action shapes: action", action.shape, ", log_prob", log_prob.shape)
-    print("Critic output shapes: q1", q1.shape, ", q2", q2.shape)
-    # Dummy training step
-    print("Running dummy training update...")
-    trainer = SACTrainer(action_dim, electronics_graph_dim)
-    # Dummy reward and done
-    r = torch.randn(batch_size, device=voxel_obs.device)
-    d = torch.zeros(batch_size, device=voxel_obs.device)
-    cl, al, alpha = trainer.update((voxel_obs, video_obs, graph_obs, action, r, voxel_obs, video_obs, graph_obs, d))
-    print("Dummy update loss: critic", cl, ", actor", al, ", alpha", alpha)
+        env_setups=env_setups,
+        tasks=tasks,
+        env_cfg=env_cfg,
+        obs_cfg=obs_cfg,
+        reward_cfg=reward_cfg,
+        command_cfg=command_cfg,
+        batch_dim=batch_size,
+        action_dim=action_dim,
+        electronics_graph_dim=electronics_graph_dim,
+    )
