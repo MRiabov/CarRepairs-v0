@@ -26,4 +26,4 @@ instance
 #custom
 *.mp4
 obs
-
+*.pt

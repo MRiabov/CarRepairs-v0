@@ -1,13 +1,15 @@
-jax[cuda]>=0.5.3
-jaxlib[cuda]>=0.5.3
-brax>=0.12.0
+# jax[cuda]>=0.5.3
+# jaxlib[cuda]>=0.5.3
+# brax>=0.12.0
 numpy>=1.22.0
-flax>=0.10
+# flax>=0.10
 ipython  # For HTML display in notebooks
 # webbrowser  # For opening visualizations in the default browser
 genesis-world
 libigl==2.5.1
-flashbax # buffers
+# flashbax # buffers
+torchrl
+
 
 #note: installing repairs-components like this: /home/mriabov/anaconda3/envs/repairs/bin/python -m pip install --force-reinstall --no-cache-dir -e .
 #has helped with the import errors
