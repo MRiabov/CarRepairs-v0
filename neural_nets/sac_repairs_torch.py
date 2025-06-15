@@ -1,4 +1,5 @@
 import copy
+from typing import Dict, List, Tuple
 
 from examples.box_to_pos_task import MoveBoxSetup
 from genesis import gs
@@ -9,6 +10,9 @@ import torch.nn.functional as F
 from torchrl.data.replay_buffers import TensorDictReplayBuffer, TensorStorage
 from torch_geometric.data import Batch, Data    
 from graphs import GraphEncoder
+from torchsparse.nn import Conv3d
+
+from .sparse_voxel_buffer import SparseVoxelBuffer
 
 
 
@@ -173,6 +177,7 @@ class SACTrainer:
         alpha_lr=3e-4,
         buffer_size=100000,
         batch_size=256,
+        cleanup_freq: int = 10,  # How often to clean up unused voxels
     ):
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
@@ -184,20 +189,36 @@ class SACTrainer:
         self.target_entropy = -action_dim
         self.gamma = gamma
         self.tau = tau
+        self.cleanup_freq = cleanup_freq
+        self.steps_since_cleanup = 0
+        
+        # Sparse voxel storage
+        self.voxel_buffer = SparseVoxelBuffer(device=self.device)
+        
+        # Optimizers
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
         self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=alpha_lr)
-        # TorchRL replay buffer
+        
+        # Replay buffer setup
         tensor_dict = {
+            "voxel_id": torch.zeros((), dtype=torch.long),  # Store voxel IDs instead of full tensors
+            "next_voxel_id": torch.zeros((), dtype=torch.long),
+            "video_obs": torch.zeros((3, 256, 256), dtype=torch.uint8),  # Example shape, adjust as needed
             "electronics_graph_obs": torch.zeros(
                 electronics_graph_dim,
-                dtype=torch.bool,  # bool for now
-            ),  # NOTE: this in particular better be done via a list of PyG batches. But later.
-            # "voxel_obs": jnp.zeros(voxel_obs_dim, dtype=jnp.int8), #make it static for now.
-            "reward": torch.zeros((), dtype=torch.bfloat16),
-            "action": torch.zeros((action_dim,), dtype=torch.bfloat16),
+                dtype=torch.bool,
+            ),
+            "next_video_obs": torch.zeros((3, 256, 256), dtype=torch.uint8),
+            "next_electronics_graph_obs": torch.zeros(
+                electronics_graph_dim,
+                dtype=torch.bool,
+            ),
+            "reward": torch.zeros((), dtype=torch.float32),
+            "action": torch.zeros((action_dim,), dtype=torch.float32),
             "done": torch.zeros((), dtype=torch.bool),
         }
+        
         self.buffer_storage = TensorStorage(
             storage=tensor_dict, max_size=buffer_size, device=self.device
         )
@@ -249,6 +270,76 @@ class SACTrainer:
 # end of SACTrainer
 
 
+    def _add_to_buffer(
+        self,
+        voxel_obs: torch.Tensor,
+        video_obs: torch.Tensor,
+        graph_obs: Batch,
+        action: torch.Tensor,
+        reward: float,
+        next_voxel_obs: torch.Tensor,
+        next_video_obs: torch.Tensor,
+        next_graph_obs: Batch,
+        done: torch.Tensor,
+    ) -> None:
+        """Helper method to add transitions to the replay buffer with sparse voxel storage."""
+        # Store voxel observations in the sparse buffer and get their IDs
+        voxel_id = self.voxel_buffer.add(voxel_obs)
+        next_voxel_id = self.voxel_buffer.add(next_voxel_obs)
+        
+        # Add to replay buffer
+        self.replay_buffer.add({
+            "voxel_id": voxel_id,
+            "video_obs": video_obs,
+            "electronics_graph_obs": graph_obs,
+            "action": action,
+            "reward": reward,
+            "next_voxel_id": next_voxel_id,
+            "next_video_obs": next_video_obs,
+            "next_electronics_graph_obs": next_graph_obs,
+            "done": done,
+        })
+        
+        # Periodically clean up unused voxels
+        self.steps_since_cleanup += 1
+        if self.steps_since_cleanup >= self.cleanup_freq:
+            self._cleanup_voxel_buffer()
+            self.steps_since_cleanup = 0
+    
+    def _cleanup_voxel_buffer(self) -> None:
+        """Clean up unused voxels from the buffer."""
+        # Get all active voxel IDs from the replay buffer
+        all_voxel_ids = torch.cat([
+            self.replay_buffer["voxel_id"],
+            self.replay_buffer["next_voxel_id"]
+        ]).unique()
+        
+        # Clean up unused voxels
+        self.voxel_buffer.cleanup(all_voxel_ids)
+
+    def get_batch_voxels(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Retrieve voxel tensors from the sparse buffer for a batch."""
+        # Get unique voxel IDs in this batch
+        voxel_ids = torch.cat([batch["voxel_id"], batch["next_voxel_id"]]).unique()
+        
+        # Create a mapping from ID to index for fast lookup
+        id_to_idx = {vid.item(): i for i, vid in enumerate(voxel_ids)}
+        
+        # Get all unique voxels
+        voxels = torch.stack([self.voxel_buffer.get(vid.item()) for vid in voxel_ids])
+        
+        # Create index tensors for batch lookups
+        batch_voxel_indices = torch.tensor(
+            [id_to_idx[vid.item()] for vid in batch["voxel_id"]],
+            device=self.device
+        )
+        next_batch_voxel_indices = torch.tensor(
+            [id_to_idx[vid.item()] for vid in batch["next_voxel_id"]],
+            device=self.device
+        )
+        
+        return voxels, batch_voxel_indices, next_batch_voxel_indices
+
 # ===== Training Orchestrator =====
 def run_training(
     env_setups,
@@ -282,61 +373,76 @@ def run_training(
     obs, _ = env.reset()
     voxel_obs, video_obs, graph_obs = obs
 
-    # Prefill replay buffer
+    # Prefill replay buffer with random actions
     for _ in range(prefill_steps):
         rand_action = torch.randn(batch_dim, action_dim, device=trainer.device)
         next_obs, reward, done, _ = env.step(rand_action)
         nv, nvid, ng = next_obs
-        trainer.replay_buffer.add(
-            {
-                "voxel_obs": voxel_obs,
-                "video_obs": video_obs,
-                "electronics_graph_obs": graph_obs,
-                "action": rand_action,
-                "reward": reward,
-                "done": done,
-                "next_voxel_obs": nv,
-                "next_video_obs": nvid,
-                "next_electronics_graph_obs": ng,
-            }
+        
+        trainer._add_to_buffer(
+            voxel_obs=voxel_obs,
+            video_obs=video_obs,
+            graph_obs=graph_obs,
+            action=rand_action,
+            reward=reward,
+            next_voxel_obs=nv,
+            next_video_obs=nvid,
+            next_graph_obs=ng,
+            done=done
         )
+        
         voxel_obs, video_obs, graph_obs = nv, nvid, ng
 
     # Main training loop
     for step in range(num_steps):
+        # Get action from policy
         action = trainer.select_action(voxel_obs, video_obs, graph_obs)
+        
+        # Step environment
         next_obs, reward, done, _ = env.step(action)
         nv, nvid, ng = next_obs
-        trainer.replay_buffer.add(
-            {
-                "voxel_obs": voxel_obs,
-                "video_obs": video_obs,
-                "electronics_graph_obs": graph_obs,
-                "action": action.to(trainer.device),
-                "reward": reward,
-                "done": done,
-                "next_voxel_obs": nv,
-                "next_video_obs": nvid,
-                "next_electronics_graph_obs": ng,
-            }
+        
+        # Store transition in replay buffer
+        trainer._add_to_buffer(
+            voxel_obs=voxel_obs,
+            video_obs=video_obs,
+            graph_obs=graph_obs,
+            action=action.to(trainer.device),
+            reward=reward,
+            next_voxel_obs=nv,
+            next_video_obs=nvid,
+            next_graph_obs=ng,
+            done=done
         )
+        
+        # Update policy if we have enough samples
         if step >= prefill_steps:
             batch = trainer.replay_buffer.sample()
+            
+            # Get voxel tensors for the batch
+            voxels, voxel_indices, next_voxel_indices = trainer.get_batch_voxels(batch)
+            
+            # Update networks
             cl, al, alpha = trainer.update(
-                (
-                    batch["voxel_obs"],
-                    batch["video_obs"],
-                    batch["electronics_graph_obs"],
-                    batch["action"],
-                    batch["reward"],
-                    batch["next_voxel_obs"],
-                    batch["next_video_obs"],
-                    batch["next_electronics_graph_obs"],
-                    batch["done"],
-                )
+                voxels=voxels,
+                video_obs=batch["video_obs"],
+                graph_obs=batch["electronics_graph_obs"],
+                action=batch["action"],
+                reward=batch["reward"],
+                next_voxels=voxels[next_voxel_indices],
+                next_video_obs=batch["next_video_obs"],
+                next_graph_obs=batch["next_electronics_graph_obs"],
+                done=batch["done"],
+                voxel_indices=voxel_indices,
             )
+            
             if step % 1000 == 0:
                 print(f"Step {step}: critic_loss={cl}, actor_loss={al}, alpha={alpha}")
+                print(f"Buffer: {len(trainer.replay_buffer)} transitions, "
+                      f"{len(trainer.voxel_buffer)} unique voxels")
+        
+        # Update observations
+        voxel_obs, video_obs, graph_obs = nv, nvid, ng
         voxel_obs, video_obs, graph_obs = nv, nvid, ng
 
 
